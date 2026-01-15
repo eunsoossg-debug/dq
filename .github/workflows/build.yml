@@ -6,13 +6,15 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest  # 여기가 핵심! 윈도우 컴퓨터를 빌려씀
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+    # 체크아웃 도구 최신화 (v3 -> v4)
+    - uses: actions/checkout@v4
 
+    # 파이썬 세팅 도구 최신화 (v4 -> v5)
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: "3.10"
 
@@ -24,8 +26,9 @@ jobs:
       run: |
         pyinstaller --noconsole --onefile --name="DQ_Checker" --clean dq_app.py
 
+    # [핵심 수정] 업로드 도구 최신화 (v3 -> v4)
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: DQ_Checker_EXE
         path: dist/DQ_Checker.exe
