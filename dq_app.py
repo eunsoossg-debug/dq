@@ -32,7 +32,7 @@ FONT_PATH, FONT_NAME = get_font_settings()
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================
-# 1. 7대 지표 정밀 분석 워커
+# 1. 7대 지표 정밀 분석 워커 (인코딩 방어력 강화)
 # ==========================================
 class AnalysisWorker(QThread):
     finished_signal = pyqtSignal(dict)
@@ -44,34 +44,56 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            # 1. 파일 읽기 (인코딩 자동 감지)
+            df = None
+            # [핵심 수정] 인코딩 자동 감지 및 순차 시도
             if self.filepath.endswith('.csv'):
-                try:
-                    df = pd.read_csv(self.filepath, low_memory=False)
-                except UnicodeDecodeError:
-                    df = pd.read_csv(self.filepath, encoding='cp949', low_memory=False)
+                # 시도할 인코딩 리스트 (순서 중요)
+                # 1. utf-8 (표준)
+                # 2. utf-8-sig (BOM이 있는 utf-8)
+                # 3. cp949 (일반적인 한글 윈도우)
+                # 4. euc-kr (구형 한글)
+                # 5. utf-16 (엑셀 내보내기 형식)
+                # 6. latin-1 (최후의 수단, 한글 깨질 수 있음)
+                encodings = ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr', 'utf-16', 'latin-1']
+                
+                for enc in encodings:
+                    try:
+                        df = pd.read_csv(self.filepath, encoding=enc, low_memory=False)
+                        # print(f"성공한 인코딩: {enc}") # 디버깅용
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                    except Exception:
+                        continue
+                
+                # 모든 인코딩 실패 시 강제 로드 (에러 문자 무시)
+                if df is None:
+                    df = pd.read_csv(self.filepath, encoding='utf-8', errors='ignore', low_memory=False)
+
             else:
+                # 엑셀 파일 로드
                 df = pd.read_excel(self.filepath)
             
+            # 데이터 로드 실패 체크
+            if df is None:
+                self.error_signal.emit("파일 형식을 인식할 수 없습니다.")
+                return
+
             total_rows = len(df)
             if total_rows == 0:
                 self.error_signal.emit("데이터가 없습니다.")
                 return
 
             # --- [1. 완전성] ---
-            # 1-1. 데이터값 완전성 (Null Check): 모든 셀 중 비어있지 않은 비율
             total_cells = df.size
             missing_cells = df.isnull().sum().sum()
             score_val_comp = (1 - (missing_cells / total_cells)) * 100
 
-            # 1-2. 레코드 완전성 (Empty Row Check): 모든 값이 비어있는 행이 없는지
-            # thresh=1 : 적어도 1개 이상의 데이터가 있어야 삭제 안 됨 -> 반대로 다 비었으면 카운트
             empty_rows = total_rows - len(df.dropna(how='all')) 
             score_rec_comp = (1 - (empty_rows / total_rows)) * 100
 
             # --- [2. 유효성] ---
-            # 2-1. 구문 유효성 (Format): 이메일, 전화번호, 날짜 등 정해진 패턴 준수율
-            # (속도를 위해 'email' 컬럼이 있을 때만 표본 검사)
+            # 2-1. 구문 유효성
             format_scores = []
             for col in df.columns:
                 c_str = str(col).lower()
@@ -86,26 +108,23 @@ class AnalysisWorker(QThread):
             
             score_syntax_val = np.mean(format_scores) * 100 if format_scores else 100.0
 
-            # 2-2. 의미 유효성 (Domain): 범주형 데이터 이상치 (예: 성별에 '남','여' 외 다른 값)
-            # 고유값이 10개 미만인 컬럼(범주형 추정)에서, 상위 99% 빈도에 속하지 않는 값 비율
+            # 2-2. 의미 유효성
             semantic_scores = []
             for col in df.columns:
                 if df[col].dtype == 'object' and df[col].nunique() < 20:
                     top_vals = df[col].value_counts(normalize=True).cumsum()
-                    # 상위 99%를 차지하는 값들을 '정상'으로 간주
                     valid_ratio = top_vals[top_vals <= 0.99].max() if not top_vals.empty else 1.0
                     semantic_scores.append(valid_ratio if not np.isnan(valid_ratio) else 1.0)
             
             score_semantic_val = np.mean(semantic_scores) * 100 if semantic_scores else 100.0
 
-            # 2-3. 범위 유효성 (Range): 수치형 데이터가 평균 ± 3표준편차 안에 있는지 (Outlier)
+            # 2-3. 범위 유효성
             range_scores = []
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             for col in numeric_cols:
                 mean = df[col].mean()
                 std = df[col].std()
                 if std > 0:
-                    # Z-score가 3 이내인 데이터 비율
                     in_range = df[col].between(mean - 3*std, mean + 3*std).sum()
                     range_scores.append(in_range / total_rows)
                 else:
@@ -113,20 +132,16 @@ class AnalysisWorker(QThread):
             
             score_range_val = np.mean(range_scores) * 100 if range_scores else 100.0
 
-            # 2-4. 관계 유효성 (Relation): 날짜 논리 오류 검사 (종료일 < 시작일)
-            # 'start', 'end' 또는 '시작', '종료'가 포함된 컬럼 쌍 찾기 (단순화된 로직)
-            score_rel_val = 100.0 # 기본값
-            # (복잡한 로직이라 여기서는 100점으로 두거나, 추후 커스텀 필요)
+            # 2-4. 관계 유효성 (단순화)
+            score_rel_val = 100.0 
             
             # --- [3. 일관성] ---
-            # 3-1. 참조 무결성 (Reference/Consistency): PK(ID) 중복 여부로 대체
-            # ID로 추정되는 컬럼(첫번째 컬럼 or 'id' 포함)의 중복 검사
+            # 3-1. 참조 무결성 (중복 검사로 대체)
             id_col = next((c for c in df.columns if 'id' in str(c).lower() or '번' in str(c)), df.columns[0])
             duplicates = df[id_col].duplicated().sum()
             score_ref_integ = (1 - (duplicates / total_rows)) * 100
 
             # --- [종합 결과] ---
-            # 7개 항목 리스트
             metrics_labels = ['값 완전성', '구조 완전성', '구문 유효성', '의미 유효성', '범위 유효성', '관계 유효성', '참조 무결성']
             metrics_scores = [
                 score_val_comp, score_rec_comp, 
@@ -134,7 +149,6 @@ class AnalysisWorker(QThread):
                 score_ref_integ
             ]
             
-            # 종합 점수 (평균)
             total_score = np.mean(metrics_scores)
             
             if total_score >= 99: grade = "Class A"
@@ -157,7 +171,7 @@ class AnalysisWorker(QThread):
             self.error_signal.emit(f"분석 중 오류 발생:\n{str(e)}")
 
 # ==========================================
-# 2. GUI 클래스 (7각형 차트 지원)
+# 2. GUI 클래스
 # ==========================================
 class DQApp(QMainWindow):
     def __init__(self):
@@ -256,7 +270,7 @@ class DQApp(QMainWindow):
         h_layout.addWidget(chart_title)
         chart_layout.addWidget(chart_header)
 
-        self.figure = Figure(figsize=(6, 6), dpi=100) # 차트 크기 키움
+        self.figure = Figure(figsize=(6, 6), dpi=100)
         self.figure.patch.set_facecolor('white')
         self.canvas = FigureCanvas(self.figure)
         chart_layout.addWidget(self.canvas)
@@ -340,21 +354,18 @@ class DQApp(QMainWindow):
         labels = result['metrics_labels']
         values = result['metrics_scores']
         
-        # 레이더 차트 그리기 (7각형)
         angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-        values += values[:1] # 닫힌 도형 만들기
+        values += values[:1]
         angles += angles[:1]
         
-        # 차트 스타일링
         ax.plot(angles, values, color='#6366f1', linewidth=2, linestyle='solid', marker='o')
         ax.fill(angles, values, color='#6366f1', alpha=0.2)
         
         ax.set_xticks(angles[:-1])
         if FONT_PATH:
-            font_prop = fm.FontProperties(fname=FONT_PATH, size=9, weight='bold') # 글씨 크기 조정
+            font_prop = fm.FontProperties(fname=FONT_PATH, size=9, weight='bold')
             ax.set_xticklabels(labels, fontproperties=font_prop, color='#334155')
         
-        # Y축(점수) 설정
         ax.set_rlabel_position(0)
         plt.yticks([20, 40, 60, 80, 100], ["20", "40", "60", "80", "100"], color="grey", size=7)
         plt.ylim(0, 100)
