@@ -1,0 +1,1 @@
+pandas\npyqt5\nmatplotlib\nopenpyxl
