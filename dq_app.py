@@ -14,8 +14,8 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QMessageBox,
-    QToolTip, QProgressBar, QDialog, QDialogButtonBox, QGroupBox, QListWidget,
-    QListWidgetItem, QComboBox, QFormLayout, QSpinBox, QLineEdit, QCheckBox
+    QProgressBar, QDialog, QDialogButtonBox, QGroupBox, QListWidget,
+    QListWidgetItem, QComboBox, QFormLayout, QSpinBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QFontDatabase
@@ -37,12 +37,11 @@ FONT_PATH, FONT_NAME = get_font_settings()
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================
-# 0-1. 유틸: 결측 정규화
+# 0-1. 결측 정규화 (공백/토큰 → NaN)
 # ==========================================
 _MISSING_LIKE = {"", " ", "  ", "nan", "NaN", "NULL", "null", "N/A", "n/a", "NA", "na", "-", "--"}
 
 def normalize_missing(df: pd.DataFrame) -> pd.DataFrame:
-    # 문자열 컬럼의 공백/특정 토큰을 NaN으로 통일
     df2 = df.copy()
     for col in df2.columns:
         if df2[col].dtype == "object":
@@ -53,16 +52,7 @@ def normalize_missing(df: pd.DataFrame) -> pd.DataFrame:
 
 # ==========================================
 # 0-2. 룰 파일 로드 (선택)
-# 규칙 파일 예시(선택):
-# {
-#   "pk": ["user_id"],
-#   "required": ["user_id","email","created_at"],
-#   "types": {"created_at":"datetime","age":"int"},
-#   "allowed_values": {"status":["A","I","D"]},
-#   "formats": {"email":"email","phone":"phone"},
-#   "timestamp_column": "created_at",
-#   "freshness_days": 30
-# }
+# base.rules.json / base.dq.json / rules.json / dq_rules.json
 # ==========================================
 def load_rules_if_exists(data_path: str) -> dict:
     base = os.path.splitext(data_path)[0]
@@ -82,7 +72,58 @@ def load_rules_if_exists(data_path: str) -> dict:
     return {}
 
 # ==========================================
-# 0-3. 룰 설정 다이얼로그 (원래 틀 유지 + PK/필수컬럼만 최소로 명시)
+# 0-3. CSV 로드 유틸 (pandas 버전 호환 + 구분자 자동감지 + 인코딩 순차시도)
+# ==========================================
+def safe_read_csv(path: str, nrows=None) -> pd.DataFrame:
+    encodings = ["utf-8", "utf-8-sig", "cp949", "euc-kr", "utf-16", "latin-1"]
+
+    last_err = None
+    for enc in encodings:
+        # 1) 우선: 엄격 로드(문제 있으면 예외)
+        try:
+            return pd.read_csv(
+                path,
+                encoding=enc,
+                nrows=nrows,
+                sep=None,           # 구분자 자동 감지
+                engine="python",    # sep=None에 필요
+                low_memory=False
+            )
+        except Exception as e:
+            last_err = e
+
+        # 2) 다음: 디코딩 오류 무시(가능한 pandas에서만)
+        try:
+            return pd.read_csv(
+                path,
+                encoding=enc,
+                nrows=nrows,
+                sep=None,
+                engine="python",
+                low_memory=False,
+                encoding_errors="ignore"   # ✅ 최신 pandas
+            )
+        except TypeError:
+            # 구버전 pandas: encoding_errors 미지원이면 skip
+            pass
+        except Exception as e:
+            last_err = e
+
+    # 여기까지 왔으면 거의 깨진 파일/특이 케이스
+    raise RuntimeError(f"CSV를 열 수 없습니다. 인코딩/구분자 문제일 수 있습니다.\n마지막 오류: {last_err}")
+
+# ==========================================
+# 0-4. Excel 로드 유틸
+# ==========================================
+def safe_read_excel(path: str, nrows=None) -> pd.DataFrame:
+    # 환경에 따라 엔진 지정이 도움이 되는 경우가 있어 분기
+    try:
+        return pd.read_excel(path, nrows=nrows, engine="openpyxl")
+    except Exception:
+        return pd.read_excel(path, nrows=nrows)
+
+# ==========================================
+# 0-5. 룰 설정 다이얼로그
 # ==========================================
 class RulesDialog(QDialog):
     def __init__(self, columns, loaded_rules=None, parent=None):
@@ -97,20 +138,20 @@ class RulesDialog(QDialog):
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            "사내 '필수항목 인증' 기준으로 PK/필수컬럼/최신성만 최소 설정하세요.\n"
-            "- PK 중복/NULL은 FAIL\n"
-            "- 필수컬럼 결측(공백 포함)은 FAIL(또는 허용치 설정 시 Conditional)\n"
-            "- 최신성은 선택(타임스탬프 컬럼 + 허용일수)"
+            "정형데이터 '필수항목 인증' 기준(권장)\n"
+            "- PK NULL 또는 중복 존재: FAIL\n"
+            "- 필수컬럼(Required) 결측(공백 포함) 허용치 초과: FAIL\n"
+            "- 최신성(선택): 타임스탬프 컬럼이 기준일수 초과: FAIL\n"
+            "- 이메일/전화 형식 검사는 참고(Conditional 판단에만 활용)"
         )
         info.setStyleSheet("color:#334155;")
         layout.addWidget(info)
 
-        # PK 선택
+        # PK
         gb_pk = QGroupBox("1) PK(유일키) 선택")
         pk_form = QFormLayout(gb_pk)
         self.pk_combo = QComboBox()
         self.pk_combo.addItems(self.columns)
-        # 룰에 pk가 있으면 첫 번째 사용
         if self.rules.get("pk"):
             pk = self.rules["pk"][0] if isinstance(self.rules["pk"], list) else self.rules["pk"]
             if pk in self.columns:
@@ -118,7 +159,7 @@ class RulesDialog(QDialog):
         pk_form.addRow("PK 컬럼:", self.pk_combo)
         layout.addWidget(gb_pk)
 
-        # 필수 컬럼 선택
+        # Required
         gb_req = QGroupBox("2) 필수 컬럼(Null/공백 허용 안 함)")
         v_req = QVBoxLayout(gb_req)
         self.req_list = QListWidget()
@@ -146,7 +187,7 @@ class RulesDialog(QDialog):
 
         layout.addWidget(gb_req)
 
-        # 최신성(선택)
+        # Freshness (optional)
         gb_time = QGroupBox("3) 최신성(선택)")
         time_form = QFormLayout(gb_time)
         self.ts_combo = QComboBox()
@@ -163,7 +204,7 @@ class RulesDialog(QDialog):
         time_form.addRow("허용 최신성(일):", self.fresh_days)
         layout.addWidget(gb_time)
 
-        # 형식 검사(선택) - 이메일/전화 정도만 (원래 코드의 구문 유효성 유지하되 '필수항목' 아닌 참고)
+        # Formats (optional)
         gb_fmt = QGroupBox("4) 형식 검사(선택/참고용)")
         fmt_form = QFormLayout(gb_fmt)
         self.email_col = QComboBox()
@@ -173,8 +214,8 @@ class RulesDialog(QDialog):
         self.phone_col.addItem("(없음)")
         self.phone_col.addItems(self.columns)
 
-        loaded_formats = self.rules.get("formats", {})
-        # 자동 세팅 시도: 룰에 있거나, 컬럼명 힌트
+        loaded_formats = self.rules.get("formats", {}) or {}
+
         def pick_by_hint(hints):
             for c in self.columns:
                 lc = c.lower()
@@ -193,7 +234,6 @@ class RulesDialog(QDialog):
         fmt_form.addRow("전화번호 컬럼:", self.phone_col)
         layout.addWidget(gb_fmt)
 
-        # 버튼
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -222,7 +262,6 @@ class RulesDialog(QDialog):
             rules["timestamp_column"] = ts
             rules["freshness_days"] = int(self.fresh_days.value())
 
-        # 선택 형식
         formats = {}
         em = self.email_col.currentText()
         ph = self.phone_col.currentText()
@@ -236,7 +275,7 @@ class RulesDialog(QDialog):
         return rules
 
 # ==========================================
-# 1. 필수항목 인증 워커 (원래 구조 유지하되 지표/판정 개선)
+# 1. 인증 워커 (필수항목 중심)
 # ==========================================
 class AnalysisWorker(QThread):
     finished_signal = pyqtSignal(dict)
@@ -249,38 +288,21 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            df = None
-
-            # ---- 파일 로드 (인코딩 방어)
-            if self.filepath.endswith('.csv'):
-                encodings = ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr', 'utf-16', 'latin-1']
-                for enc in encodings:
-                    try:
-                        df = pd.read_csv(self.filepath, encoding=enc, low_memory=False)
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                    except Exception:
-                        continue
-                if df is None:
-                    df = pd.read_csv(self.filepath, encoding='utf-8', errors='ignore', low_memory=False)
+            # ---- 파일 로드
+            if self.filepath.lower().endswith(".csv"):
+                df = safe_read_csv(self.filepath, nrows=None)
             else:
-                df = pd.read_excel(self.filepath)
+                df = safe_read_excel(self.filepath, nrows=None)
 
-            if df is None:
-                self.error_signal.emit("파일 형식을 인식할 수 없습니다.")
-                return
-
-            if len(df) == 0:
+            if df is None or len(df) == 0:
                 self.error_signal.emit("데이터가 없습니다.")
                 return
 
             df = normalize_missing(df)
-
             total_rows = len(df)
             total_cells = df.size
 
-            # ---- 규칙 준비
+            # ---- 규칙
             pk_cols = self.rules.get("pk", [])
             if isinstance(pk_cols, str):
                 pk_cols = [pk_cols]
@@ -297,7 +319,7 @@ class AnalysisWorker(QThread):
 
             formats = self.rules.get("formats", {}) or {}
 
-            # ---- (0) 스키마 적합성: required/PK 컬럼 존재 여부
+            # ---- (0) 스키마 적합성
             schema_missing = []
             for c in set(required_cols + ([pk_col] if pk_col else []) + ([timestamp_col] if timestamp_col else [])):
                 if c and c not in df.columns:
@@ -306,31 +328,28 @@ class AnalysisWorker(QThread):
             score_schema = 100.0 if not schema_missing else 0.0
             hard_fail_schema = bool(schema_missing)
 
-            # ---- (1) 완전성(값): 전체 결측
+            # ---- (1) 값 완전성(전체)
             missing_cells = df.isnull().sum().sum()
             score_val_comp = (1 - (missing_cells / total_cells)) * 100
 
-            # ---- (2) 완전성(필수컬럼): 필수컬럼 결측률 (인증 핵심)
+            # ---- (2) 필수 완전성(행 기준)
             hard_fail_required = False
             req_missing_pct = 0.0
             req_missing_rows_idx = set()
-            if required_cols:
-                # 필수 컬럼 중 하나라도 NaN이면 해당 행을 오류로 잡음
+            if required_cols and all(c in df.columns for c in required_cols):
                 req_missing_mask = df[required_cols].isnull().any(axis=1)
                 req_missing_rows = int(req_missing_mask.sum())
                 req_missing_pct = (req_missing_rows / total_rows) * 100
                 req_missing_rows_idx = set(df.index[req_missing_mask].tolist())
 
-                # 점수는 100 - 결측행비율
                 score_req_comp = max(0.0, 100.0 - req_missing_pct)
 
-                # Hard fail: 허용치 초과
                 if req_missing_pct > required_missing_threshold_pct:
                     hard_fail_required = True
             else:
                 score_req_comp = 100.0
 
-            # ---- (3) PK 무결성(유일성 + NULL)
+            # ---- (3) PK 무결성
             hard_fail_pk = False
             pk_dup_cnt = 0
             pk_null_cnt = 0
@@ -346,26 +365,23 @@ class AnalysisWorker(QThread):
                 if pk_dup_cnt > 0:
                     pk_issue_idx |= set(df.index[pk_dup_mask].tolist())
 
-                # 유일성 점수: 중복/NULL 행 비율 기반
                 pk_bad = len(pk_issue_idx)
                 score_pk = max(0.0, 100.0 - (pk_bad / total_rows) * 100)
 
-                # Hard fail: PK NULL 또는 중복 존재
                 if pk_null_cnt > 0 or pk_dup_cnt > 0:
                     hard_fail_pk = True
             else:
-                # PK가 지정되지 않으면 인증 관점에서 FAIL로는 두지 않되 점수는 낮게(운영 경고)
+                # PK 미지정은 FAIL로 강제하지 않지만 운영상 경고
                 score_pk = 70.0
 
-            # ---- (4) 형식 유효성(참고): 이메일/전화 (원래 코드 유지하되 "인증 필수 아님")
+            # ---- (4) 형식 유효성(참고)
             fmt_issue_idx = set()
             fmt_scores = []
-            # email
+
             email_col = formats.get("email", None)
             if email_col and email_col in df.columns:
                 pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
                 s = df[email_col].astype(str).fillna("")
-                # 결측은 이 지표에선 제외(필수는 완전성에서 걸림)
                 non_empty = s.str.strip() != ""
                 valid = s.str.match(pattern) & non_empty
                 valid_cnt = int(valid.sum())
@@ -373,7 +389,6 @@ class AnalysisWorker(QThread):
                 fmt_scores.append((valid_cnt / denom) if denom else 1.0)
                 fmt_issue_idx |= set(df.index[non_empty & (~valid)].tolist())
 
-            # phone
             phone_col = formats.get("phone", None)
             if phone_col and phone_col in df.columns:
                 pattern = r'^\d{2,3}[- .]?\d{3,4}[- .]?\d{4}$'
@@ -387,17 +402,17 @@ class AnalysisWorker(QThread):
 
             score_format = (np.mean(fmt_scores) * 100) if fmt_scores else 100.0
 
-            # ---- (5) 최신성(선택): timestamp_col 최대값이 기준일 이내인지
+            # ---- (5) 최신성(선택)
             hard_fail_fresh = False
             score_fresh = 100.0
             fresh_issue_idx = set()
             freshness_msg = ""
+
             if timestamp_col and timestamp_col in df.columns and freshness_days > 0:
-                # datetime 변환 실패는 NaT로 처리
                 ts = pd.to_datetime(df[timestamp_col], errors="coerce")
                 max_ts = ts.max()
+
                 if pd.isna(max_ts):
-                    # 타임스탬프가 전부 깨짐 → 운영상 FAIL에 준함 (선택항목이지만, 설정했으면 책임)
                     score_fresh = 0.0
                     hard_fail_fresh = True
                     freshness_msg = f"{timestamp_col}를 날짜로 해석할 수 없습니다."
@@ -405,7 +420,6 @@ class AnalysisWorker(QThread):
                 else:
                     now = pd.Timestamp.now()
                     age_days = (now - max_ts).days
-                    # 점수는 0~100, 기준일 넘어가면 선형 감점(참고용)
                     if age_days <= freshness_days:
                         score_fresh = 100.0
                     else:
@@ -413,28 +427,24 @@ class AnalysisWorker(QThread):
                         hard_fail_fresh = True
                         freshness_msg = f"최신 데이터({max_ts.date()})가 허용({freshness_days}일) 초과: {age_days}일 경과"
 
-            # ---- 오류 프리뷰: 실제 위반 행만 모아서 보여주기
+            # ---- 위반 행 프리뷰
             issue_idx = set()
             issue_idx |= req_missing_rows_idx
             issue_idx |= pk_issue_idx
             issue_idx |= fmt_issue_idx
             issue_idx |= fresh_issue_idx
 
-            # 스키마 미스는 행으로 잡을 수 없으니 별도 메시지로만
-            if issue_idx:
-                preview_df = df.loc[sorted(list(issue_idx))].head(50)
-            else:
-                preview_df = df.head(50)
+            preview_df = df.loc[sorted(list(issue_idx))].head(50) if issue_idx else df.head(50)
 
-            # ---- 지표 구성 (원래 "7대" 틀 유지: 의미/범위/관계 같은 논쟁성 지표 제거하고, 인증 필수/운영 보조로 재정의)
+            # ---- 지표(7개 틀 유지: 인증 필수/참고/선택 혼합)
             metrics_labels = [
                 "스키마 적합성",   # 필수
-                "값 완전성",       # 참고(전체 결측)
+                "값 완전성",       # 참고
                 "필수 완전성",     # 필수
                 "PK 무결성",       # 필수
                 "형식 유효성",     # 참고
                 "최신성",          # 선택/운영
-                "참고(예비)"       # 틀 유지용(항상 100)
+                "참고(예비)"       # 틀 유지용
             ]
             metrics_scores = [
                 score_schema,
@@ -446,10 +456,9 @@ class AnalysisWorker(QThread):
                 100.0
             ]
 
-            # ---- 인증 판정 로직 (Hard fail 중심)
+            # ---- 판정 (Hard fail 중심)
             hard_fail = hard_fail_schema or hard_fail_required or hard_fail_pk or hard_fail_fresh
 
-            # Conditional: hard fail은 아니지만 경미한 이슈(예: 형식 유효성 낮음, 전체 결측 높음)
             conditional = False
             if not hard_fail:
                 if score_format < 95 or score_val_comp < 95:
@@ -462,10 +471,8 @@ class AnalysisWorker(QThread):
             else:
                 grade = "PASS"
 
-            # 종합점수는 참고치로만 제공(운영/대시보드용)
             total_score = float(np.mean(metrics_scores))
 
-            # 추가 설명 메시지
             notes = []
             if schema_missing:
                 notes.append(f"스키마 누락: {', '.join(schema_missing)}")
@@ -474,40 +481,38 @@ class AnalysisWorker(QThread):
             if pk_col:
                 notes.append(f"PK({pk_col}) NULL={pk_null_cnt}, 중복행수={pk_dup_cnt}")
             else:
-                notes.append("PK 미지정: 점수만 감점(권장: PK 지정)")
+                notes.append("PK 미지정: 점수 감점(권장: PK 지정)")
             if freshness_msg:
                 notes.append(f"최신성: {freshness_msg}")
 
             result = {
                 "grade": grade,
-                "score": round(total_score, 2),
+                "score": round(total_score, 2),  # 참고용
                 "metrics_labels": metrics_labels,
                 "metrics_scores": metrics_scores,
                 "row_count": total_rows,
                 "preview": preview_df,
                 "notes": "\n".join(notes) if notes else ""
             }
-
             self.finished_signal.emit(result)
 
         except Exception as e:
             self.error_signal.emit(f"분석 중 오류 발생:\n{str(e)}")
 
 # ==========================================
-# 2. GUI 클래스 (원래 틀 유지 + 규칙 설정 단계만 추가)
+# 2. GUI 클래스 (원래 틀 유지 + 규칙설정 단계)
 # ==========================================
 class DQApp(QMainWindow):
     def __init__(self):
         super().__init__()
         if FONT_PATH and os.path.exists(FONT_PATH):
             QFontDatabase.addApplicationFont(FONT_PATH)
-        self.setWindowTitle("DQ Pro - 필수항목 인증(정형데이터) v2.1")
+        self.setWindowTitle("DQ Pro - 필수항목 인증(정형데이터) v2.2")
         self.setGeometry(100, 100, 1300, 900)
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: #f3f4f6; }}
             QLabel {{ font-family: '{FONT_NAME}', sans-serif; }}
             QPushButton {{ font-family: '{FONT_NAME}', sans-serif; }}
-            QToolTip {{ background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; font-family: '{FONT_NAME}'; }}
             QProgressBar {{ border: 2px solid #e2e8f0; border-radius: 5px; text-align: center; }}
             QProgressBar::chunk {{ background-color: #3b82f6; width: 10px; }}
         """)
@@ -520,7 +525,7 @@ class DQApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 사이드바
+        # Sidebar
         sidebar = QFrame()
         sidebar.setFixedWidth(270)
         sidebar.setStyleSheet("background-color: #0f172a; border-right: 1px solid #334155;")
@@ -528,7 +533,7 @@ class DQApp(QMainWindow):
         side_layout.setContentsMargins(30, 50, 30, 50)
         side_layout.setSpacing(20)
 
-        title_lbl = QLabel("DQ CHECKER\nPRO v2.1")
+        title_lbl = QLabel("DQ CHECKER\nPRO v2.2")
         title_lbl.setStyleSheet("color: white; font-size: 28px; font-weight: 900; line-height: 1.2;")
         side_layout.addWidget(title_lbl)
 
@@ -566,18 +571,17 @@ class DQApp(QMainWindow):
         side_layout.addStretch(4)
         main_layout.addWidget(sidebar)
 
-        # 메인 콘텐츠
+        # Main content
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
         content_layout.setContentsMargins(40, 40, 40, 40)
         content_layout.setSpacing(30)
 
-        # 상단 카드
         score_layout = QHBoxLayout()
         score_layout.setSpacing(20)
 
-        self.card_grade = self.create_card("인증 판정", "-", "#8b5cf6", "Hard Fail(치명 결함) 중심으로 PASS/FAIL/CONDITIONAL PASS를 판정합니다.")
-        self.card_score = self.create_card("참고 점수", "0", "#10b981", "대시보드용 참고 점수(평균). 인증 판정은 별도 규칙으로 결정됩니다.")
+        self.card_grade = self.create_card("인증 판정", "-", "#8b5cf6", "Hard Fail 중심으로 PASS/FAIL/CONDITIONAL PASS를 판정합니다.")
+        self.card_score = self.create_card("참고 점수", "0", "#10b981", "대시보드용 참고 점수(평균). 판정과는 별개입니다.")
         self.card_rows = self.create_card("검사 데이터 수", "0", "#3b82f6", "검사 완료된 총 레코드 개수입니다.")
 
         score_layout.addWidget(self.card_grade)
@@ -585,21 +589,15 @@ class DQApp(QMainWindow):
         score_layout.addWidget(self.card_rows)
         content_layout.addLayout(score_layout)
 
-        # 하단 (차트 + 테이블)
         bottom_layout = QHBoxLayout()
         bottom_layout.setSpacing(20)
 
-        # 차트 영역
         chart_frame = QFrame()
         chart_frame.setStyleSheet("background-color: white; border-radius: 16px; border: 1px solid #e2e8f0;")
         chart_layout = QVBoxLayout(chart_frame)
-
-        chart_header = QWidget()
-        h_layout = QHBoxLayout(chart_header)
         chart_title = QLabel("품질 지표 분석 (Radar Chart)")
         chart_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #334155;")
-        h_layout.addWidget(chart_title)
-        chart_layout.addWidget(chart_header)
+        chart_layout.addWidget(chart_title)
 
         self.figure = Figure(figsize=(6, 6), dpi=100)
         self.figure.patch.set_facecolor('white')
@@ -607,7 +605,6 @@ class DQApp(QMainWindow):
         chart_layout.addWidget(self.canvas)
         bottom_layout.addWidget(chart_frame, stretch=5)
 
-        # 테이블 영역
         table_frame = QFrame()
         table_frame.setStyleSheet("background-color: white; border-radius: 16px; border: 1px solid #e2e8f0;")
         table_layout = QVBoxLayout(table_frame)
@@ -627,17 +624,12 @@ class DQApp(QMainWindow):
     def create_card(self, title, value, color, description):
         frame = QFrame()
         frame.setToolTip(description)
-        try:
-            frame.setCursor(Qt.WhatsThisCursor)
-        except Exception:
-            frame.setCursor(Qt.PointingHandCursor)
         frame.setStyleSheet(f"""
             QFrame {{ background-color: white; border-radius: 16px; border: 1px solid #e2e8f0; border-left: 6px solid {color}; }}
             QFrame:hover {{ border: 1px solid {color}; background-color: #f8fafc; }}
         """)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(25, 25, 25, 25)
-
         lbl_title = QLabel(title)
         lbl_title.setStyleSheet("color: #64748b; font-size: 14px; font-weight: bold; border: none; background: transparent;")
         lbl_val = QLabel(value)
@@ -658,18 +650,12 @@ class DQApp(QMainWindow):
         if not fname:
             return
 
-        # 1) 룰 자동 로드 시도 + 컬럼 추출(다이얼로그 채우기용)
+        # 1) 컬럼 추출(다이얼로그 용) - 여기서 errors/encoding_errors 인자 사용 금지!
         try:
-            # 빠른 컬럼 읽기: csv는 nrows=5, excel은 head
-            if fname.endswith(".csv"):
-                # 인코딩은 여기서 너무 집착하지 않고, 워커에서 최종 처리
-                try:
-                    tmp = pd.read_csv(fname, nrows=5, encoding="utf-8", low_memory=False)
-                except Exception:
-                    tmp = pd.read_csv(fname, nrows=5, encoding="cp949", low_memory=False, errors="ignore")
+            if fname.lower().endswith(".csv"):
+                tmp = safe_read_csv(fname, nrows=5)
             else:
-                tmp = pd.read_excel(fname, nrows=5)
-
+                tmp = safe_read_excel(fname, nrows=5)
             cols = tmp.columns
         except Exception as e:
             QMessageBox.critical(self, "오류", f"컬럼 정보를 읽을 수 없습니다:\n{e}")
@@ -682,7 +668,6 @@ class DQApp(QMainWindow):
             return
         rules = dlg.get_rules()
 
-        # 2) 워커 실행
         self.btn_upload.setText("인증 분석 중... (대기)")
         self.btn_upload.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -720,7 +705,6 @@ class DQApp(QMainWindow):
         self.update_card_value(self.card_rows, f"{result['row_count']:,}")
         self.notes_lbl.setText(result.get("notes", ""))
 
-        # Radar
         self.figure.clear()
         ax = self.figure.add_subplot(111, polar=True)
         ax.set_facecolor('#f8fafc')
@@ -751,7 +735,6 @@ class DQApp(QMainWindow):
 
         self.canvas.draw()
 
-        # Table
         df = result['preview']
         self.table.setRowCount(df.shape[0])
         self.table.setColumnCount(df.shape[1])
