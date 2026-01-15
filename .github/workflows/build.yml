@@ -1,0 +1,31 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest  # 여기가 핵심! 윈도우 컴퓨터를 빌려씀
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        pip install pandas pyqt5 matplotlib openpyxl pyinstaller
+
+    - name: Build EXE
+      run: |
+        pyinstaller --noconsole --onefile --name="DQ_Checker" --clean dq_app.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: DQ_Checker_EXE
+        path: dist/DQ_Checker.exe
