@@ -44,10 +44,17 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            # 대용량 파일 읽기 최적화
+            # [수정된 부분] 인코딩 자동 감지 로직 추가
             if self.filepath.endswith('.csv'):
-                df = pd.read_csv(self.filepath, low_memory=False)
+                try:
+                    # 1순위: UTF-8로 시도 (일반적인 표준)
+                    df = pd.read_csv(self.filepath, low_memory=False)
+                except UnicodeDecodeError:
+                    # 2순위: 실패하면 한국 윈도우 전용(CP949/EUC-KR)로 재시도
+                    # print("UTF-8 디코딩 실패, CP949로 재시도합니다.")
+                    df = pd.read_csv(self.filepath, encoding='cp949', low_memory=False)
             else:
+                # 엑셀 파일은 인코딩 문제 거의 없음
                 df = pd.read_excel(self.filepath)
             
             total_rows = len(df)
@@ -67,8 +74,11 @@ class AnalysisWorker(QThread):
             # C. 유효성
             validity_scores = []
             for col in df.columns:
-                if 'email' in col.lower():
+                # 컬럼명도 문자열로 확실히 변환 후 체크
+                col_name = str(col).lower()
+                if 'email' in col_name or '이메일' in col_name:
                     pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+                    # 벡터화 연산 최적화
                     valid_mask = df[col].astype(str).str.match(pattern)
                     valid_cnt = valid_mask.sum()
                     validity_scores.append(valid_cnt / total_rows)
@@ -83,6 +93,7 @@ class AnalysisWorker(QThread):
             elif total_score >= 95: grade = "Class C"
             else: grade = "Uncertified"
 
+            # 결과 전달
             result = {
                 "grade": grade,
                 "score": round(total_score, 2),
@@ -95,7 +106,7 @@ class AnalysisWorker(QThread):
             self.finished_signal.emit(result)
 
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(f"파일을 읽는 중 오류가 발생했습니다.\n내용: {str(e)}")
 
 # ==========================================
 # 2. GUI 클래스
@@ -180,7 +191,7 @@ class DQApp(QMainWindow):
         content_layout.setContentsMargins(40, 40, 40, 40)
         content_layout.setSpacing(30)
 
-        # 1. 상단 스코어 카드
+        # 상단 스코어
         score_layout = QHBoxLayout()
         score_layout.setSpacing(20)
         self.card_grade = self.create_card("최종 등급", "-", "#8b5cf6", "종합 점수에 따른 등급입니다.")
@@ -191,7 +202,7 @@ class DQApp(QMainWindow):
         score_layout.addWidget(self.card_rows)
         content_layout.addLayout(score_layout)
 
-        # 2. 중간 영역
+        # 하단 차트 및 테이블
         bottom_layout = QHBoxLayout()
         bottom_layout.setSpacing(20)
 
@@ -233,9 +244,7 @@ class DQApp(QMainWindow):
     def create_card(self, title, value, color, description):
         frame = QFrame()
         frame.setToolTip(description)
-        
-        # [수정] Qt.HelpCursor -> Qt.WhatsThisCursor 로 변경 (에러 해결)
-        # 만약 이것도 안되면 Qt.PointingHandCursor 사용
+        # 커서 설정 오류 방지
         try:
             frame.setCursor(Qt.WhatsThisCursor)
         except AttributeError:
@@ -281,7 +290,7 @@ class DQApp(QMainWindow):
 
     def on_analysis_error(self, err_msg):
         self.reset_ui_state()
-        QMessageBox.critical(self, "Error", f"분석 중 오류 발생:\n{err_msg}")
+        QMessageBox.critical(self, "Error", f"분석 오류 발생:\n{err_msg}")
 
     def reset_ui_state(self):
         self.btn_upload.setText("📂  데이터 파일 열기")
